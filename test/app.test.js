@@ -1,3 +1,4 @@
+process.env.JWT_SECRET ??= require('node:crypto').randomBytes(32).toString('hex');
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
