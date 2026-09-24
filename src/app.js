@@ -2,7 +2,17 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const _ = require('lodash');
 const config = require('./config');
-const { createDb, hashPassword, all, allBound } = require('./db');
+const { createDb, verifyPassword, allBound } = require('./db');
+
+// Ganti karakter khusus HTML menjadi entity supaya tidak dieksekusi browser
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 async function createApp() {
   const app = express();
@@ -16,7 +26,7 @@ async function createApp() {
     const header = req.headers.authorization || '';
     const token = header.replace('Bearer ', '');
     try {
-      req.user = jwt.verify(token, config.jwtSecret);
+      req.user = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] });
       next();
     } catch (err) {
       res.status(401).json({ error: 'Token tidak valid' });
@@ -29,19 +39,20 @@ async function createApp() {
   // Halaman sambutan
   app.get('/welcome', (req, res) => {
     const name = req.query.name || 'Tamu';
-    res.send(`<h1>Selamat datang di SecurePay, ${name}!</h1>`);
+    res.send(`<h1>Selamat datang di SecurePay, ${escapeHtml(name)}!</h1>`);
   });
 
   // Login -> mengembalikan JWT
   app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
-    const rows = allBound(
-      db,
-      'SELECT id, username, role FROM users WHERE username = ? AND password_hash = ?',
-      [username, hashPassword(String(password))]
-    );
-    if (rows.length === 0) return res.status(401).json({ error: 'Username atau password salah' });
-    const token = jwt.sign({ id: rows[0].id, username: rows[0].username, role: rows[0].role }, config.jwtSecret, {
+    // 1) ambil user berdasarkan username saja, 2) verifikasi password-nya
+    const user = allBound(db, 'SELECT id, username, role, password_hash FROM users WHERE username = ?', [
+      String(username),
+    ])[0];
+    if (!user || !verifyPassword(String(password), user.password_hash)) {
+      return res.status(401).json({ error: 'Username atau password salah' });
+    }
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, config.jwtSecret, {
       expiresIn: '1h',
     });
     res.json({ token });
@@ -50,13 +61,16 @@ async function createApp() {
   // Cari pengguna berdasarkan nama
   app.get('/api/users/search', (req, res) => {
     const q = req.query.q || '';
-    const rows = all(db, `SELECT id, username, full_name FROM users WHERE full_name LIKE '%${q}%'`);
+    // Parameterized query: input dikirim sebagai DATA, bukan bagian dari perintah SQL
+    const rows = allBound(db, 'SELECT id, username, full_name FROM users WHERE full_name LIKE ?', [`%${q}%`]);
     res.json(rows);
   });
 
   // Detail pengguna berdasarkan id
   app.get('/api/users/:id', (req, res) => {
-    const rows = all(db, 'SELECT id, username, full_name, role FROM users WHERE id = ' + req.params.id);
+    // Validasi: id harus berupa angka bulat positif
+    if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: 'ID tidak valid' });
+    const rows = allBound(db, 'SELECT id, username, full_name, role FROM users WHERE id = ?', [Number(req.params.id)]);
     if (rows.length === 0) return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
     res.json(rows[0]);
   });
@@ -88,8 +102,10 @@ async function createApp() {
   });
 
   // Penanganan error
+  // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
-    res.status(500).send(`<pre>${err.stack}</pre>`);
+    console.error(err); // detail lengkap hanya di log server
+    res.status(500).json({ error: 'Terjadi kesalahan pada server' }); // pesan generik ke klien
   });
 
   return app;
