@@ -1,3 +1,4 @@
+const testKey = 'sk_live_•••••••••••••••••••••••••';
 // ============================================================
 //  PERINGATAN: aplikasi ini SENGAJA dibuat rentan untuk praktikum.
 //  Jangan gunakan kode ini (atau pola di dalamnya) di production.
