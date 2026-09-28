@@ -17,6 +17,19 @@ function escapeHtml(value) {
 async function createApp() {
   const app = express();
   const db = await createDb();
+  
+  // Jangan umumkan framework yang dipakai (header X-Powered-By: Express)
+  app.disable('x-powered-by');
+
+  // Header keamanan untuk semua respons
+  app.use((req, res, next) => {
+    res.set({
+      'X-Content-Type-Options': 'nosniff', // browser tidak menebak-nebak tipe konten
+      'X-Frame-Options': 'DENY', // halaman tidak boleh dimuat di dalam iframe (clickjacking)
+      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; form-action 'none'",
+    });
+    next();
+  });
   let settings = _.cloneDeep(config.defaultSettings);
 
   app.use(express.json());
