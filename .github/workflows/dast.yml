@@ -1,0 +1,125 @@
+name: DAST (OWASP ZAP)
+
+# Dijalankan manual: tab Actions -> "DAST (OWASP ZAP)" -> Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZAP_VERSION: "2.17.0"
+  ZAP_SHA256: "efe799aaa3627db683b43f00c9c210aea0b75c00cc8f0a0f0434d12bb3ddde5a"
+  TARGET: http://localhost:3000
+  ZAP: http://127.0.0.1:8090
+
+jobs:
+  zap:
+    name: DAST Scan (OWASP ZAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Jalankan SecurePay (target scan)
+        run: |
+          # Secret acak khusus untuk sekali scan ini
+          JWT_SECRET="$(openssl rand -hex 32)" nohup npm start > "$RUNNER_TEMP/app.log" 2>&1 &
+          for i in $(seq 30); do curl -sf "$TARGET/health" && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/app.log"; exit 1
+
+      - name: Install dan jalankan ZAP (versi di-pin + verifikasi checksum)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/zap.tar.gz" \
+            "https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}/ZAP_${ZAP_VERSION}_Linux.tar.gz"
+          echo "${ZAP_SHA256}  $RUNNER_TEMP/zap.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/zap.tar.gz" -C "$RUNNER_TEMP"
+          java -version
+          # API tanpa key hanya aman karena ZAP terikat ke 127.0.0.1 di runner sekali pakai
+          nohup "$RUNNER_TEMP/ZAP_${ZAP_VERSION}/zap.sh" -daemon -host 127.0.0.1 -port 8090 \
+            -config api.disablekey=true -dir "$RUNNER_TEMP/zaphome" > "$RUNNER_TEMP/zap.log" 2>&1 &
+          for i in $(seq 90); do curl -sf "$ZAP/JSON/core/view/version/" && exit 0; sleep 2; done
+          tail -50 "$RUNNER_TEMP/zap.log"; exit 1
+
+      # SecurePay adalah API tanpa link antarhalaman, jadi endpoint dikenalkan lewat proxy ZAP
+      - name: Daftarkan endpoint API ke ZAP
+        run: |
+          c() { curl -s -x "$ZAP" "$@"; echo; }
+          c "$TARGET/health"
+          c "$TARGET/welcome?name=Budi"
+          c "$TARGET/api/users/search?q=Budi"
+          c "$TARGET/api/users/2"
+          TOKEN=$(curl -s -x "$ZAP" -H 'Content-Type: application/json' \
+            -d '{"username":"budi","password":"budi123"}' "$TARGET/api/login" | jq -r .token)
+          echo "login OK, token: ${TOKEN:0:12}..."
+          c -H "Authorization: Bearer $TOKEN" "$TARGET/api/balance/budi"
+          c -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"from":"budi","to":"sari","amount":1000}' "$TARGET/api/transfer"
+          c -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"currency":"IDR"}' "$TARGET/api/settings"
+
+      - name: 1) Crawling (Spider)
+        run: |
+          id=$(curl -s "$ZAP/JSON/spider/action/scan/?url=$TARGET&recurse=true" | jq -r .scan)
+          until [ "$(curl -s "$ZAP/JSON/spider/view/status/?scanId=$id" | jq -r .status)" = 100 ]; do sleep 2; done
+          curl -s "$ZAP/JSON/core/view/urls/?baseurl=$TARGET" | jq -r '.urls[]' | tee "$RUNNER_TEMP/urls.txt"
+
+      - name: 2) Passive Scan
+        run: |
+          until [ "$(curl -s "$ZAP/JSON/pscan/view/recordsToScan/" | jq -r .recordsToScan)" = 0 ]; do sleep 2; done
+          curl -s "$ZAP/JSON/core/view/alerts/?baseurl=$TARGET" > "$RUNNER_TEMP/passive.json"
+          jq -r '.alerts | group_by(.alert)[] | "[\(.[0].risk)] \(.[0].alert): \(length)"' "$RUNNER_TEMP/passive.json"
+
+      - name: 3) Active Scan
+        run: |
+          id=$(curl -s "$ZAP/JSON/ascan/action/scan/?url=$TARGET&recurse=true" | jq -r .scan)
+          until [ "$(curl -s "$ZAP/JSON/ascan/view/status/?scanId=$id" | jq -r .status)" = 100 ]; do
+            echo "progress: $(curl -s "$ZAP/JSON/ascan/view/status/?scanId=$id" | jq -r .status)%"; sleep 10
+          done
+          until [ "$(curl -s "$ZAP/JSON/pscan/view/recordsToScan/" | jq -r .recordsToScan)" = 0 ]; do sleep 2; done
+          curl -s "$ZAP/JSON/ascan/view/scans/" > "$RUNNER_TEMP/scans.json"
+          curl -s "$ZAP/JSON/ascan/view/scanProgress/?scanId=$id" > "$RUNNER_TEMP/progress.json"
+          curl -s "$ZAP/JSON/core/view/alerts/?baseurl=$TARGET" > "$RUNNER_TEMP/all.json"
+          curl -s "$ZAP/OTHER/core/other/htmlreport/" > zap-report.html
+          jq -r '.alerts | group_by(.alert)[] | "[\(.[0].risk)] \(.[0].alert): \(length)"' "$RUNNER_TEMP/all.json"
+
+      - name: Ringkasan hasil
+        run: |
+          RANK='{"High":0,"Medium":1,"Low":2,"Informational":3}'
+          tabel() {
+            echo "| Risk | Alert | Jumlah | Contoh URL |"
+            echo "|---|---|---|---|"
+            jq -r --argjson rank "$RANK" '.alerts | group_by(.alert) | sort_by($rank[.[0].risk]) | .[]
+              | "| \(.[0].risk) | \(.[0].alert) | \(length) | `\(.[0].method) \(.[0].url)` |"' "$1"
+          }
+          {
+            echo "## Hasil DAST OWASP ZAP ${ZAP_VERSION}"
+            echo "Commit \`${GITHUB_SHA:0:7}\` · branch \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### 1) Crawling: $(wc -l < "$RUNNER_TEMP/urls.txt") URL"
+            echo '```'; cat "$RUNNER_TEMP/urls.txt"; echo '```'
+            echo "### 2) Passive Scan"
+            tabel "$RUNNER_TEMP/passive.json"
+            echo
+            echo "### 3) Active Scan: $(jq -r '.scans[-1].reqCount' "$RUNNER_TEMP/scans.json") request serangan"
+            tabel "$RUNNER_TEMP/all.json"
+            echo
+            echo "#### Aturan serangan injeksi yang dijalankan"
+            echo "| Aturan | Status | Alert |"
+            echo "|---|---|---|"
+            jq -r '.scanProgress[1].HostProcess[].Plugin
+              | select(.[0] | test("SQL Injection|Cross Site Scripting|Path Traversal|OS Command|Code Injection|Template Injection"))
+              | "| \(.[0]) | \(.[3]) | \(.[6]) |"' "$RUNNER_TEMP/progress.json"
+            echo
+            echo "### Header respons \`GET /welcome?name=Budi\`"
+            echo '```'; curl -sI "$TARGET/welcome?name=Budi" | tr -d '\r'; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zap-report
+          path: zap-report.html
